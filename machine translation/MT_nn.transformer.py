@@ -9,17 +9,17 @@ import torch.nn.functional as F
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
-device = torch.device("cpu")
+device = torch.device("cuda")
 
-Lang1 = Field(eos_token='<eos>', include_lengths=True)
+Lang1 = Field(eos_token='<eos>')
 
-Lang2 = Field(init_token='<sos>',eos_token='<eos>', include_lengths=True)
+Lang2 = Field(init_token='<sos>',eos_token='<eos>')
 train = TranslationDataset(path='../Datasets/MT_data/',
                            exts=('eng-fra.train.fr', 'eng-fra.train.en'),
                            fields=[('Lang1', Lang1), ('Lang2', Lang2)])
 
 train_iter, val_iter, test_iter = BucketIterator.splits((train, train, train),
-                                                        batch_size=64, repeat=False)
+                                                        batch_size=256, repeat=False)
 Lang1.build_vocab(train)
 Lang2.build_vocab(train)
 
@@ -33,7 +33,7 @@ Lang2.build_vocab(train)
 
 class PositionalEncoding(nn.Module):
 
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
+    def __init__(self, d_model, dropout=0.1, max_len=20):
         """
         d_model 常等于 embed_size
         (1/10000)^(2i/dmodel) = e^(2i)*(-log(10000)/dmodel)
@@ -71,15 +71,22 @@ class LanguageTransformer(nn.Module):
     def forward(self, src, tgt, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask, tgt_mask):
         # src = rearrange(src, 'n s -> s n')
         # tgt = rearrange(tgt, 'n t -> t n')
+        # print(src.size())
+
         src = self.pos_enc(self.embed_src(src) * math.sqrt(self.d_model))
         tgt = self.pos_enc(self.embed_tgt(tgt) * math.sqrt(self.d_model))
+        src = src.transpose(1, 0)
+        tgt = tgt.transpose(1, 0)
 
-        output = self.transformer(src, tgt, tgt_mask=tgt_mask, src_key_padding_mask=src_key_padding_mask,
+        # print(src.size())
+        # print(tgt.size())
+        output = self.transformer(src, tgt,  src_key_padding_mask=src_key_padding_mask,
                                   tgt_key_padding_mask=tgt_key_padding_mask,
-                                  memory_key_padding_mask=memory_key_padding_mask)
+                                  memory_key_padding_mask=memory_key_padding_mask,tgt_mask=tgt_mask)
         # output = rearrange(output, 't n e -> n t e')
+        output = output.transpose(0,1)
         # print(output.size())
-        output = output.permute(1, 0, 2)
+        # # print(Y.view(-1, Y.shape[-1]))
         return self.fc(output)
 
     def generate_square_subsequent_mask(self, sz):
@@ -91,18 +98,17 @@ class LanguageTransformer(nn.Module):
         return mask
 
 
-num_epochs = 20
-max_seq_length = 96
+num_epochs = 100
+max_seq_length = 2000
 src_vocab_size = len(Lang1.vocab.itos)
 tgt_vocab_size = len(Lang2.vocab.itos)
 d_model = 512
-num_encoder_layers = 6
-num_decoder_layers = 6
-dim_feedforward = 2048
+num_encoder_layers = 2
+num_decoder_layers = 2
+dim_feedforward = 512
 nhead = 8
 pos_dropout = 0.1
 trans_dropout = 0.1
-n_warmup_steps = 4000
 model = LanguageTransformer(src_vocab_size,
                             tgt_vocab_size,
                             d_model, nhead,
@@ -117,8 +123,8 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 print(Lang1.vocab.itos)
 print(Lang2.vocab.itos)
 
-print(Lang1.vocab.stoi['<pad>'])
-print(Lang2.vocab.stoi['<pad>'])
+# print(Lang1.vocab.stoi['<pad>'])
+# print(Lang2.vocab.stoi['<pad>'])
 
 
 # for i, train_batch in enumerate(train_iter):
@@ -127,23 +133,23 @@ print(Lang2.vocab.stoi['<pad>'])
 #
 
 
-criterion = nn.CrossEntropyLoss(ignore_index=1)
 
 #
 for epoch in range(num_epochs):
     l_sum = 0.0
     for i, train_batch in enumerate(train_iter):
-        X = train_batch.Lang1[0].data.to(device)
-        label = train_batch.Lang2[0].data.to(device)
-        Y = label[:-1,:]
+        X = train_batch.Lang1.data.transpose(0, 1).to(device)
 
-        src_key_padding_mask = X.clone()
-        src_key_padding_mask = src_key_padding_mask == 1
-        src_key_padding_mask = src_key_padding_mask.permute(1, 0)
+        label = train_batch.Lang2.data.transpose(0, 1).to(device)
 
-        tgt_key_padding_mask = Y.clone()
-        tgt_key_padding_mask = tgt_key_padding_mask == 1
-        tgt_key_padding_mask = tgt_key_padding_mask.permute(1, 0)
+        Y = label[:,:-1]
+
+
+        # src_key_padding_mask = X.clone()
+        src_key_padding_mask = X == 1
+
+        # tgt_key_padding_mask = Y.clone()
+        tgt_key_padding_mask = Y == 1
 
         # src_key_padding_mask = torch.ones_like(X, dtype=torch.uint8)
         # pad_x = train_batch.Lang1[1].data
@@ -159,8 +165,8 @@ for epoch in range(num_epochs):
         # tgt_key_padding_mask = tgt_key_padding_mask == 1
         # tgt_key_padding_mask = tgt_key_padding_mask.permute(1,0)
 
-        memory_key_padding_mask = src_key_padding_mask.clone()
-        tgt_mask = model.generate_square_subsequent_mask(sz=Y.size()[0])
+        memory_key_padding_mask = src_key_padding_mask.clone().to(device)
+        tgt_mask = model.generate_square_subsequent_mask(sz=Y.size()[1]).to(device)
         # print(tgt_mask)
 
         # print(src_key_padding_mask)
@@ -168,26 +174,41 @@ for epoch in range(num_epochs):
         outputs = model(X, Y, tgt_mask=tgt_mask, src_key_padding_mask=src_key_padding_mask,
                                   tgt_key_padding_mask=tgt_key_padding_mask,
                                   memory_key_padding_mask=memory_key_padding_mask)
-        outputs = outputs.reshape((-1,outputs.size()[-1])) # (b t) v
-        tgt_out = label[1:,:].reshape(1,-1).squeeze(0) # (b o)
-        loss = criterion(outputs, tgt_out)
-        optimizer.zero_grad()
 
-        # print(Y[:,0])
+        tgt_out = label[:,1:]
+        # print(tgt_out.tolist())
+        # print(outputs[0])
+        # print(tgt_out.tolist())
+        # tgt_out = .reshape(-1)# (b o)
+
+        loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.shape[-1]),
+            tgt_out.reshape(-1),
+            ignore_index=1
+        )
+        print(loss.item())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        # train_acc_batch = (outputs.argmax(dim=1) == tgt_out).sum().item() / tgt_out.shape[0]
+
+        # print(loss.item())
         # print(label[1:,:][:,0])
         # print(tgt_mask)
-        print('loss',loss.item())
+        # print('loss',loss.item())
+        # print(loss.item())
 
-        # loss.backward()
-        optimizer.step()
-        # loss = criterion((outputs, 'b t v -> (b t) v'), rearrange(tgt_out, 'b o -> (b o)'))
 
-#         l = batch_loss(encoder, decoder, X, Y, loss)
-#         l.backward()
-#         optimizer.step()
-#         l_sum += l.item()
-#     if (epoch + 1) % 1 == 0:
-#         print("epoch %d, loss %.3f" % (epoch + 1, l_sum /
-#                                        len(train_iter)))
+
+        l_sum += loss.item()
+    if (epoch + 1) % 1 == 0:
+        print("epoch %d, loss %.3f" % (epoch + 1, l_sum /
+                                       len(train_iter)))
+        # print(train_acc_batch)
+        # print(outputs)
+        # print(outputs.argmax(dim=1))
+
+
 # #
 # torch.save(self.state_dict(), self.seq2seq_save_dir)
+
