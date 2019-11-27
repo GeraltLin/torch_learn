@@ -8,28 +8,27 @@ import torch
 import torch.nn.functional as F
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
 device = torch.device("cpu")
 
+Lang1 = Field(eos_token='<eos>', include_lengths=True)
 
-Lang1 = Field(eos_token='<eos>',include_lengths=True)
-Lang2 = Field(init_token='<sos>',include_lengths=True)
+Lang2 = Field(init_token='<sos>',eos_token='<eos>', include_lengths=True)
 train = TranslationDataset(path='../Datasets/MT_data/',
                            exts=('eng-fra.train.fr', 'eng-fra.train.en'),
                            fields=[('Lang1', Lang1), ('Lang2', Lang2)])
 
 train_iter, val_iter, test_iter = BucketIterator.splits((train, train, train),
-                                                        batch_size=256, repeat=False)
+                                                        batch_size=64, repeat=False)
 Lang1.build_vocab(train)
 Lang2.build_vocab(train)
 
-for i, train_batch in enumerate(train_iter):
-    print('Lang1  : \n', [Lang1.vocab.itos[x] for x in train_batch.Lang1[0].data[:,0]])
-    print('Lang1  : \n', train_batch.Lang1[1].data[0])
-    print('Lang2 : \n', [Lang2.vocab.itos[x] for x in train_batch.Lang2[0].data[:,0]])
-    print('Lang2 : \n', train_batch.Lang2[1].data[0])
+# for i, train_batch in enumerate(train_iter):
+#     print('Lang1  : \n', [Lang1.vocab.itos[x] for x in train_batch.Lang1[0].data[:, 0]])
+#     print('Lang1  : \n', train_batch.Lang1[1].data[0])
+#     print('Lang2 : \n', [Lang2.vocab.itos[x] for x in train_batch.Lang2[0].data[:, 0]])
+#     print('Lang2 : \n', train_batch.Lang2[1].data[0])
     # print('Lang2 : \n', [Lang2.vocab.itos[x] for x in train_batch.Lang2[0].data[:,0]])
-
-
 
 
 class PositionalEncoding(nn.Module):
@@ -57,14 +56,16 @@ class PositionalEncoding(nn.Module):
 
 
 class LanguageTransformer(nn.Module):
-    def __init__(self, src_vocab_size,tgt_vocab_size, d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, max_seq_length, pos_dropout, trans_dropout):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, nhead, num_encoder_layers, num_decoder_layers,
+                 dim_feedforward, max_seq_length, pos_dropout, trans_dropout):
         super().__init__()
         self.d_model = d_model
         self.embed_src = nn.Embedding(src_vocab_size, d_model)
         self.embed_tgt = nn.Embedding(tgt_vocab_size, d_model)
         self.pos_enc = PositionalEncoding(d_model, pos_dropout, max_seq_length)
 
-        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, trans_dropout)
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward,
+                                          trans_dropout)
         self.fc = nn.Linear(d_model, tgt_vocab_size)
 
     def forward(self, src, tgt, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask, tgt_mask):
@@ -74,13 +75,20 @@ class LanguageTransformer(nn.Module):
         tgt = self.pos_enc(self.embed_tgt(tgt) * math.sqrt(self.d_model))
 
         output = self.transformer(src, tgt, tgt_mask=tgt_mask, src_key_padding_mask=src_key_padding_mask,
-                                  tgt_key_padding_mask=tgt_key_padding_mask, memory_key_padding_mask=memory_key_padding_mask)
+                                  tgt_key_padding_mask=tgt_key_padding_mask,
+                                  memory_key_padding_mask=memory_key_padding_mask)
         # output = rearrange(output, 't n e -> n t e')
-        output = output.permute(1,0)
+        # print(output.size())
+        output = output.permute(1, 0, 2)
         return self.fc(output)
 
-
-
+    def generate_square_subsequent_mask(self, sz):
+        r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
+            Unmasked positions are filled with float(0.0).
+        """
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
 
 
 num_epochs = 20
@@ -95,61 +103,85 @@ nhead = 8
 pos_dropout = 0.1
 trans_dropout = 0.1
 n_warmup_steps = 4000
-model = LanguageTransformer( src_vocab_size,
-                             tgt_vocab_size,
-                             d_model, nhead,
-                             num_encoder_layers,
-                             num_decoder_layers,
-                             dim_feedforward,
-                             max_seq_length,
-                             pos_dropout,
-                             trans_dropout)
+model = LanguageTransformer(src_vocab_size,
+                            tgt_vocab_size,
+                            d_model, nhead,
+                            num_encoder_layers,
+                            num_decoder_layers,
+                            dim_feedforward,
+                            max_seq_length,
+                            pos_dropout,
+                            trans_dropout)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-
 
 print(Lang1.vocab.itos)
 print(Lang2.vocab.itos)
+
+print(Lang1.vocab.stoi['<pad>'])
+print(Lang2.vocab.stoi['<pad>'])
+
+
+# for i, train_batch in enumerate(train_iter):
+#     print('Lang1  : \n', [Lang1.vocab.itos[x] for x in train_batch.Lang1.data[:,0]])
+#     print('Lang2 : \n', [Lang2.vocab.itos[x] for x in train_batch.Lang2.data[:,0]])
 #
-def mask_pad(X):
 
-    mask = torch.zeros_like(X, dtype=torch.uint8)
-    max_num = X.size()[-1]
-    pad_x = batch.text[1].data
-    for index, num in enumerate(pad_x.tolist()):
-        mask[index, 0:num] = 1
 
-    masks = []
-    lenth_with_pad = batch[0].size()[0]
-    lenth_without_pad_batch = batch[1]
-    for i, lenth_without_pad in enumerate(lenth_without_pad_batch):
-        masks.append([False for _ in range(lenth_without_pad)] + [True for _ in range(lenth_with_pad - lenth_without_pad)])
+criterion = nn.CrossEntropyLoss(ignore_index=1)
 
-    return masks
 #
 for epoch in range(num_epochs):
     l_sum = 0.0
     for i, train_batch in enumerate(train_iter):
         X = train_batch.Lang1[0].data.to(device)
-        Y = train_batch.Lang2[0].data.to(device)
+        label = train_batch.Lang2[0].data.to(device)
+        Y = label[:-1,:]
 
-        src_key_padding_mask = torch.zeros_like(X, dtype=torch.uint8)
-        src_key_padding_mask_num = X.size()[-1]
-        pad_x = train_batch.Lang1[1].data
-        pad_y = train_batch.Lang2[1].data
-        for index, num in enumerate(pad_x.tolist()):
-            src_key_padding_mask[0:num, index] = 1
+        src_key_padding_mask = X.clone()
+        src_key_padding_mask = src_key_padding_mask == 1
+        src_key_padding_mask = src_key_padding_mask.permute(1, 0)
 
+        tgt_key_padding_mask = Y.clone()
+        tgt_key_padding_mask = tgt_key_padding_mask == 1
+        tgt_key_padding_mask = tgt_key_padding_mask.permute(1, 0)
 
-        for index, num in enumerate(pad_y.tolist()):
-            tgt_key_padding_mask[0:num, index] = 1
+        # src_key_padding_mask = torch.ones_like(X, dtype=torch.uint8)
+        # pad_x = train_batch.Lang1[1].data
+        # for index, num in enumerate(pad_x.tolist()):
+        #     src_key_padding_mask[0:num, index] = 0
+        # src_key_padding_mask = src_key_padding_mask == 1
+        # src_key_padding_mask = src_key_padding_mask.permute(1,0)
+        #
+        # tgt_key_padding_mask = torch.ones_like(Y, dtype=torch.uint8)
+        # pad_y = train_batch.Lang2[1].data
+        # for index, num in enumerate(pad_y.tolist()):
+        #     tgt_key_padding_mask[0:num, index] = 0
+        # tgt_key_padding_mask = tgt_key_padding_mask == 1
+        # tgt_key_padding_mask = tgt_key_padding_mask.permute(1,0)
 
+        memory_key_padding_mask = src_key_padding_mask.clone()
+        tgt_mask = model.generate_square_subsequent_mask(sz=Y.size()[0])
+        # print(tgt_mask)
 
-        optimizer.zero_grad()
+        # print(src_key_padding_mask)
         model = model.to(device)
-        outputs = model(X, Y, src_key_padding_mask, tgt_key_padding_mask[:, :-1], memory_key_padding_mask,
-                        tgt_mask)
-#
+        outputs = model(X, Y, tgt_mask=tgt_mask, src_key_padding_mask=src_key_padding_mask,
+                                  tgt_key_padding_mask=tgt_key_padding_mask,
+                                  memory_key_padding_mask=memory_key_padding_mask)
+        outputs = outputs.reshape((-1,outputs.size()[-1])) # (b t) v
+        tgt_out = label[1:,:].reshape(1,-1).squeeze(0) # (b o)
+        loss = criterion(outputs, tgt_out)
+        optimizer.zero_grad()
+
+        # print(Y[:,0])
+        # print(label[1:,:][:,0])
+        # print(tgt_mask)
+        print('loss',loss.item())
+
+        # loss.backward()
+        optimizer.step()
+        # loss = criterion((outputs, 'b t v -> (b t) v'), rearrange(tgt_out, 'b o -> (b o)'))
+
 #         l = batch_loss(encoder, decoder, X, Y, loss)
 #         l.backward()
 #         optimizer.step()
