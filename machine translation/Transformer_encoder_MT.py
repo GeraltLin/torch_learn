@@ -1,49 +1,25 @@
 import math
 import torch
 import torch.nn as nn
-from torchtext.data import Field, BucketIterator
-from torchtext.datasets import TranslationDataset
-from torch import nn
-import torch
 import torch.nn.functional as F
-
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-
-
-Lang1 = Field(eos_token='<eos>')
-Lang2 = Field(init_token='<sos>')
-train = TranslationDataset(path='../Datasets/MT_data/',
-                           exts=('eng-fra.train.fr', 'eng-fra.train.en'),
-                           fields=[('Lang1', Lang1), ('Lang2', Lang2)])
-
-train_iter, val_iter, test_iter = BucketIterator.splits((train, train, train),
-                                                        batch_size=256, repeat=False)
-Lang1.build_vocab(train)
-Lang2.build_vocab(train)
 
 class TransformerModel(nn.Module):
 
-    def __init__(self, enc_vocab_size, dec_vocab_size, embed_size, nhead, nhid, nlayers, dropout=0.5):
+    def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5):
         super(TransformerModel, self).__init__()
+        from torch.nn import TransformerEncoder, TransformerEncoderLayer
         self.model_type = 'Transformer'
         self.src_mask = None
-        self.pos_encoder = PositionalEncoding(embed_size, dropout)
-        encoder_layers = TransformerEncoderLayer(embed_size, nhead, nhid, dropout)
+        self.pos_encoder = PositionalEncoding(ninp, dropout)
+        encoder_layers = TransformerEncoderLayer(ninp, nhead, nhid, dropout)
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
-        self.encoder = nn.Embedding(enc_vocab_size, embed_size)
-        self.embed_size = embed_size
-        self.decoder = nn.Linear(embed_size, dec_vocab_size)
+        self.encoder = nn.Embedding(ntoken, ninp)
+        self.ninp = ninp
+        self.decoder = nn.Linear(ninp, ntoken)
 
         self.init_weights()
 
     def _generate_square_subsequent_mask(self, sz):
-        """
-        ([[0., 0., 0., 0., 0.],
-        [-inf, 0., 0., 0., 0.],
-        [-inf, -inf, 0., 0., 0.],
-        [-inf, -inf, -inf, 0., 0.],
-        [-inf, -inf, -inf, -inf, 0.]])
-        """
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
@@ -60,7 +36,7 @@ class TransformerModel(nn.Module):
             mask = self._generate_square_subsequent_mask(len(src)).to(device)
             self.src_mask = mask
 
-        src = self.encoder(src) * math.sqrt(self.embed_size)
+        src = self.encoder(src) * math.sqrt(self.ninp)
         src = self.pos_encoder(src)
         output = self.transformer_encoder(src, self.src_mask)
         output = self.decoder(output)
@@ -69,10 +45,6 @@ class TransformerModel(nn.Module):
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model, dropout=0.1, max_len=5000):
-        """
-        d_model 常等于 embed_size
-        (1/10000)^(2i/dmodel) = e^(2i)*(-log(10000)/dmodel)
-        """
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -82,7 +54,6 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-        # register_buffer 不被更新的量
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -90,14 +61,19 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 import torchtext
+
+def tokenizer(text):
+    return list(text)
+
 from torchtext.data.utils import get_tokenizer
-TEXT = torchtext.data.Field(tokenize=get_tokenizer("basic_english"),
+TEXT = torchtext.data.Field(tokenize=tokenizer,
                             init_token='<sos>',
                             eos_token='<eos>',
                             lower=True)
 train_txt, val_txt, test_txt = torchtext.datasets.WikiText2.splits(TEXT)
 TEXT.build_vocab(train_txt)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 def batchify(data, bsz):
     data = TEXT.numericalize([data.examples[0].text])
@@ -115,13 +91,86 @@ train_data = batchify(train_txt, batch_size)
 val_data = batchify(val_txt, eval_batch_size)
 test_data = batchify(test_txt, eval_batch_size)
 
-enc_vocab_size = len(Lang1.vocab.stoi)
-dec_vocab_size = len(Lang2.vocab.stoi)
 
-embed_size = 200
+bptt = 35
+def get_batch(source, i):
+    seq_len = min(bptt, len(source) - 1 - i)
+    data = source[i:i+seq_len]
+    target = source[i+1:i+1+seq_len].view(-1)
+    return data, target
+
+
+ntokens = len(TEXT.vocab.stoi) # the size of vocabulary
+emsize = 200 # embedding dimension
 nhid = 200 # the dimension of the feedforward network model in nn.TransformerEncoder
 nlayers = 2 # the number of nn.TransformerEncoderLayer in nn.TransformerEncoder
 nhead = 2 # the number of heads in the multiheadattention models
 dropout = 0.2 # the dropout value
+model = TransformerModel(ntokens, emsize, nhead, nhid, nlayers, dropout).to(device)
 
-model = TransformerModel(enc_vocab_size, dec_vocab_size, embed_size, nhead, nhid, nlayers, dropout).to(device)
+
+criterion = nn.CrossEntropyLoss()
+lr = 5.0 # learning rate
+optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
+
+import time
+def train():
+    model.train() # Turn on the train mode
+    total_loss = 0.
+    start_time = time.time()
+    ntokens = len(TEXT.vocab.stoi)
+    for batch, i in enumerate(range(0, train_data.size(0) - 1, bptt)):
+        data, targets = get_batch(train_data, i)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output.view(-1, ntokens), targets)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+
+        total_loss += loss.item()
+        log_interval = 200
+        if batch % log_interval == 0 and batch > 0:
+            cur_loss = total_loss / log_interval
+            elapsed = time.time() - start_time
+            print('| epoch {:3d} | {:5d}/{:5d} batches | '
+                  'lr {:02.2f} | ms/batch {:5.2f} | '
+                  'loss {:5.2f} | ppl {:8.2f}'.format(
+                    epoch, batch, len(train_data) // bptt, scheduler.get_lr()[0],
+                    elapsed * 1000 / log_interval,
+                    cur_loss, math.exp(cur_loss)))
+            total_loss = 0
+            start_time = time.time()
+
+def evaluate(eval_model, data_source):
+    eval_model.eval() # Turn on the evaluation mode
+    total_loss = 0.
+    ntokens = len(TEXT.vocab.stoi)
+    with torch.no_grad():
+        for i in range(0, data_source.size(0) - 1, bptt):
+            data, targets = get_batch(data_source, i)
+            output = eval_model(data)
+            output_flat = output.view(-1, ntokens)
+            total_loss += len(data) * criterion(output_flat, targets).item()
+    return total_loss / (len(data_source) - 1)
+
+best_val_loss = float("inf")
+epochs = 3 # The number of epochs
+best_model = None
+
+for epoch in range(1, epochs + 1):
+    epoch_start_time = time.time()
+    train()
+    val_loss = evaluate(model, val_data)
+    print('-' * 89)
+    print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+          'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
+                                     val_loss, math.exp(val_loss)))
+    print('-' * 89)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model = model
+
+    scheduler.step()
